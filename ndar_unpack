@@ -1,4 +1,4 @@
-#!/usr/bin/python
+# !/usr/bin/python
 # See file COPYING distributed with ndar_unpack for copyright and license.
 
 import sys
@@ -16,15 +16,19 @@ import gzip
 import struct
 import json
 import dicom
-import boto.s3.connection
+
+import boto3
+from boto3.s3.transfer import S3Transfer
+import botocore
 
 version = 'ndar_unpack 0.1.2'
 
 # import nibabel if possible
-# and since we're just using nibabel for MINC2, consider the import 
+# and since we're just using nibabel for MINC2, consider the import
 # unsuccessful if nibabel.Minc2Image doesn't exist
 try:
     import nibabel
+
     nibabel.Minc2Image
 except:
     nibabel = None
@@ -78,94 +82,98 @@ Written by Christian Haselgrove, 2014.
 
 """
 
-image03_fields = ('subjectkey', 'src_subject_id', 'interview_date', 
-                  'interview_age', 'gender', 'comments_misc', 'image_file', 
-                  'image_thumbnail_file', 'image_description', 
-                  'image_file_format', 'image_modality', 
-                  'scanner_manufacturer_pd', 'scanner_type_pd', 
-                  'scanner_software_versions_pd', 'magnetic_field_strength', 
-                  'mri_repetition_time_pd', 'mri_echo_time_pd', 'flip_angle', 
-                  'acquisition_matrix', 'mri_field_of_view_pd', 
-                  'patient_position', 'photomet_interpret', 'receive_coil', 
-                  'transmit_coil', 'transformation_performed', 
-                  'transformation_type', 'image_history', 
-                  'image_num_dimensions', 'image_extent1', 'image_extent2', 
-                  'image_extent3', 'image_extent4', 'extent4_type', 
-                  'image_extent5', 'extent5_type', 'image_unit1', 
-                  'image_unit2', 'image_unit3', 'image_unit4', 'image_unit5', 
-                  'image_resolution1', 'image_resolution2', 
-                  'image_resolution3', 'image_resolution4', 
-                  'image_resolution5', 'image_slice_thickness', 
-                  'image_orientation', 'qc_outcome', 'qc_description', 
-                  'qc_fail_quest_reason', 'time_diff_units', 
-                  'decay_correction', 'frame_end_times', 'frame_end_unit', 
-                  'frame_start_times', 'frame_start_unit', 'pet_isotope', 
-                  'pet_tracer', 'time_diff_inject_to_image', 'pulse_seq', 
-                  'slice_acquisition', 'software_preproc', 'experiment_id', 
+image03_fields = ('subjectkey', 'src_subject_id', 'interview_date',
+                  'interview_age', 'gender', 'comments_misc', 'image_file',
+                  'image_thumbnail_file', 'image_description',
+                  'image_file_format', 'image_modality',
+                  'scanner_manufacturer_pd', 'scanner_type_pd',
+                  'scanner_software_versions_pd', 'magnetic_field_strength',
+                  'mri_repetition_time_pd', 'mri_echo_time_pd', 'flip_angle',
+                  'acquisition_matrix', 'mri_field_of_view_pd',
+                  'patient_position', 'photomet_interpret', 'receive_coil',
+                  'transmit_coil', 'transformation_performed',
+                  'transformation_type', 'image_history',
+                  'image_num_dimensions', 'image_extent1', 'image_extent2',
+                  'image_extent3', 'image_extent4', 'extent4_type',
+                  'image_extent5', 'extent5_type', 'image_unit1',
+                  'image_unit2', 'image_unit3', 'image_unit4', 'image_unit5',
+                  'image_resolution1', 'image_resolution2',
+                  'image_resolution3', 'image_resolution4',
+                  'image_resolution5', 'image_slice_thickness',
+                  'image_orientation', 'qc_outcome', 'qc_description',
+                  'qc_fail_quest_reason', 'time_diff_units',
+                  'decay_correction', 'frame_end_times', 'frame_end_unit',
+                  'frame_start_times', 'frame_start_unit', 'pet_isotope',
+                  'pet_tracer', 'time_diff_inject_to_image', 'pulse_seq',
+                  'slice_acquisition', 'software_preproc', 'experiment_id',
                   'scan_type', 'data_file2', 'data_file2_type')
 
 # order matters; see NIfTI_1.__init__()
-nifti_units_xyz = (('Meters', 1), 
-                   ('Millimeters', 2), 
+nifti_units_xyz = (('Meters', 1),
+                   ('Millimeters', 2),
                    ('Micrometers', 3))
 
 # order matters; see NIfTI_1.__init__()
-nifti_units_t = (('Seconds', 8), 
-                 ('Milliseconds', 16), 
+nifti_units_t = (('Seconds', 8),
+                 ('Milliseconds', 16),
                  ('Microseconds', 24))
 
+
 def convert_dicom_time(val):
-    return str(float(val)/1000.0)
+    return str(float(val) / 1000.0)
+
 
 def convert_dicom_date(val):
     mo = dicom_date_re.search(val)
     if mo is None:
         return None
-    return '%s/%s/%s' % (mo.groupdict['month'], 
-                         mo.groupdict['day'], 
+    return '%s/%s/%s' % (mo.groupdict['month'],
+                         mo.groupdict['day'],
                          mo.groupdict['year'])
+
 
 def convert_dicom_float(val):
     if not isinstance(val, dicom.valuerep.DSfloat):
         return None
     return float(val)
 
+
 dicom_date_re = re.compile('^(P<year>\d\d\d\d)(P<month>\d\d)(P<day>\d\d)$')
 
 # image03 field => (DICOM tag, formatting/conversion function)
-image03_dicom = {'gender': ('PatientSex', None), 
-                 'image_modality': ('Modality', None), 
-                 'scanner_manufacturer_pd': ('Manufacturer', None), 
-                 'scanner_type_pd': ('ManufacturerModelName', None), 
-                 'magnetic_field_strength': ('MagneticFieldStrength', 
-                                             convert_dicom_float),  
-                 'flip_angle': ('FlipAngle', convert_dicom_float), 
-                 'acquisition_matrix': ('AcquisitionMatrix', None), 
-                 'patient_position': ('PatientPosition', None), 
-                 'photomet_interpret': ('PhotometricInterpretation', None), 
-                 'receive_coil': ('ReceiveCoilName', None), 
-                 'transmit_coil': ('TransmitCoilName', None), 
-                 'interview_date': ('StudyDate', convert_dicom_date), 
-                 'mri_repetition_time_pd': ('RepititionTime', 
+image03_dicom = {'gender': ('PatientSex', None),
+                 'image_modality': ('Modality', None),
+                 'scanner_manufacturer_pd': ('Manufacturer', None),
+                 'scanner_type_pd': ('ManufacturerModelName', None),
+                 'magnetic_field_strength': ('MagneticFieldStrength',
+                                             convert_dicom_float),
+                 'flip_angle': ('FlipAngle', convert_dicom_float),
+                 'acquisition_matrix': ('AcquisitionMatrix', None),
+                 'patient_position': ('PatientPosition', None),
+                 'photomet_interpret': ('PhotometricInterpretation', None),
+                 'receive_coil': ('ReceiveCoilName', None),
+                 'transmit_coil': ('TransmitCoilName', None),
+                 'interview_date': ('StudyDate', convert_dicom_date),
+                 'mri_repetition_time_pd': ('RepititionTime',
                                             convert_dicom_time),
                  'mri_echo_time_pd': ('EchoTime', convert_dicom_time)}
 
-def find_data_handler(tempdir):
 
+def find_data_handler(tempdir):
     """attempt to find a class (BaseData subclass) that can handle the data"""
 
-    # each class constructor will raise TypeError if it won't handle the data 
-    # and DataError if it finds an error in the data, so hidden in this loop 
+    # each class constructor will raise TypeError if it won't handle the data
+    # and DataError if it finds an error in the data, so hidden in this loop
     # is also data checking
 
     message(NOTICE, 'inspecting data...')
     data = None
-    for data_class in (NIfTIGzData, 
-                       NIfTIData, 
-                       AFNIData, 
-                       MINCData, 
-                       MINC2Data, 
-                       NRRDData, 
+    for data_class in (NIfTIGzData,
+                       NIfTIData,
+                       AFNIData,
+                       MINCData,
+                       MINC2Data,
+                       NRRDData,
                        DICOMData):
         try:
             message(DEBUG, 'trying %s' % str(data_class))
@@ -179,17 +187,18 @@ def find_data_handler(tempdir):
 
     return data
 
+
 SILENT = 0
 ERROR = 1
 NOTICE = 2
 DEBUG = 3
+
 
 #############################################################################
 # exceptions
 #
 
 class BaseError(Exception):
-
     """base class for exceptions"""
 
     def __init__(self, error):
@@ -198,23 +207,23 @@ class BaseError(Exception):
     def __str__(self):
         return self.error
 
-class DataError(BaseError):
 
+class DataError(BaseError):
     """error in the data"""
 
     def __str__(self):
         return 'bad data: %s' % self.error
 
-class GeneralError(BaseError):
 
+class GeneralError(BaseError):
     """error running"""
+
 
 #############################################################################
 # classes
 #
 
 class NIfTI_1:
-
     """NIfTI-1 volume"""
 
     def __init__(self, fname):
@@ -250,7 +259,7 @@ class NIfTI_1:
         self.vox_offset = struct.unpack('%sf' % bo, header_bytes[108:112])[0]
         self.xyzt_units = struct.unpack('%sB' % bo, header_bytes[123:124])[0]
 
-        # order matters here; xyzt_units = 3 will match both Meters (1) and 
+        # order matters here; xyzt_units = 3 will match both Meters (1) and
         # Micrometers (3), so we go from less to more specific
         self.xyz_units = None
         for (name, value) in nifti_units_xyz:
@@ -265,27 +274,27 @@ class NIfTI_1:
 
         return
 
-class BaseData:
 
+class BaseData:
     """base class for data handling classes
 
     Subclasses should define:
 
-        @property image03(), which returns a dictionary containing the 
+        @property image03(), which returns a dictionary containing the
         image03 structure
 
-        nii_gz(), which creates a .nii.gz.  If a file name is specified, 
-        the NIfTI volume should be written to that file; otherwise a 
+        nii_gz(), which creates a .nii.gz.  If a file name is specified,
+        the NIfTI volume should be written to that file; otherwise a
         temporary file should be created.  Returns the file name.
 
-        header(), which returns a string containing the header information (in 
+        header(), which returns a string containing the header information (in
         an arbitrary format).
 
-    Each subclass should define __init__() such that it returns only if 
-    it is prepared to handle the data in the passed temporary directory.  
-    If the class rejects the data (e.g. a DICOM handler recieves a NIfTI 
-    file), __init__() should raise TypeError; if the class accepts the 
-    data but finds an error (e.g. a DICOM handler finds more than one 
+    Each subclass should define __init__() such that it returns only if
+    it is prepared to handle the data in the passed temporary directory.
+    If the class rejects the data (e.g. a DICOM handler recieves a NIfTI
+    file), __init__() should raise TypeError; if the class accepts the
+    data but finds an error (e.g. a DICOM handler finds more than one
     series), __init__() should raise DataError.
     """
 
@@ -302,7 +311,7 @@ class BaseData:
         return
 
     def _image03_from_nifti(self):
-        """fill as much of the image03 structure as possible from the NIfTI 
+        """fill as much of the image03 structure as possible from the NIfTI
         volume
 
         this also initializes _image03 with the known fields
@@ -316,7 +325,7 @@ class BaseData:
 
         self._image03['image_num_dimensions'] = vol.dim[0]
 
-        for i in xrange(1, vol.dim[0]+1):
+        for i in xrange(1, vol.dim[0] + 1):
             self._image03['image_extent%d' % i] = vol.dim[i]
             self._image03['image_resolution%d' % i] = vol.pixdim[i]
             if i < 4 and vol.xyz_units:
@@ -327,11 +336,11 @@ class BaseData:
         return self._image03
 
     def stdout_fname(self):
-        return os.path.join(os.path.join(self.tempdir, 'output'), 
+        return os.path.join(os.path.join(self.tempdir, 'output'),
                             '%d.out' % self.process_index)
 
     def stderr_fname(self):
-        return os.path.join(os.path.join(self.tempdir, 'output'), 
+        return os.path.join(os.path.join(self.tempdir, 'output'),
                             '%d.err' % self.process_index)
 
     def call(self, args):
@@ -371,6 +380,7 @@ class BaseData:
             raise GeneralError('error running %s' % args[0])
         return
 
+
 class NIfTIGzData(BaseData):
 
     def __init__(self, tempdir):
@@ -405,6 +415,7 @@ class NIfTIGzData(BaseData):
         self.check_call(args)
         return open(self.stdout_fname()).read()
 
+
 class NIfTIData(BaseData):
 
     def __init__(self, tempdir):
@@ -438,6 +449,7 @@ class NIfTIData(BaseData):
         args = ['nifti_tool', '-disp_hdr', '-infiles', self.contents[0]]
         self.check_call(args)
         return open(self.stdout_fname()).read()
+
 
 class AFNIData(BaseData):
 
@@ -478,6 +490,7 @@ class AFNIData(BaseData):
     def header(self):
         return open(self.head).read()
 
+
 class MINCData(BaseData):
 
     def __init__(self, tempdir):
@@ -488,7 +501,7 @@ class MINCData(BaseData):
             raise TypeError('too many files')
         if not self.contents[0].endswith('.mnc'):
             raise TypeError('bad extension')
-        # since both MINC and MINC2 use .mnc, we also check the NetCDF magic 
+        # since both MINC and MINC2 use .mnc, we also check the NetCDF magic
         # number here
         if open(self.contents[0]).read(3) != 'CDF':
             raise TypeError('bad magic number')
@@ -514,6 +527,7 @@ class MINCData(BaseData):
     def header(self):
         self.check_call(['mincheader', self.contents[0]])
         return open(self.stdout_fname()).read()
+
 
 class MINC2Data(BaseData):
 
@@ -563,6 +577,7 @@ class MINC2Data(BaseData):
         data += '\n'
         return data
 
+
 class NRRDData(BaseData):
 
     def __init__(self, tempdir):
@@ -607,6 +622,7 @@ class NRRDData(BaseData):
         for key in self.im.GetMetaDataKeys():
             data += '    %s = %s\n' % (key, str(self.im.GetMetaData(key)))
         return data
+
 
 class DICOMData(BaseData):
 
@@ -661,6 +677,7 @@ class DICOMData(BaseData):
         do = dicom.read_file(self.contents[0])
         return '%s\n' % str(do)
 
+
 #############################################################################
 # functions
 #
@@ -680,64 +697,67 @@ def message(level, msg):
         fo.write('%s%s\n' % (prefix, line))
     return
 
+
 #############################################################################
 # command line parsing
 #
 
 progname = os.path.basename(sys.argv[0])
 
-parser = argparse.ArgumentParser(description=description, 
+parser = argparse.ArgumentParser(description=description,
                                  formatter_class=argparse.RawTextHelpFormatter)
 
-parser.add_argument('--self-check', '-S', 
-                    default=False, 
-                    dest='self_check_flag', 
-                    action='store_true', 
+parser.add_argument('--self-check', '-S',
+                    default=False,
+                    dest='self_check_flag',
+                    action='store_true',
                     help='run self check')
-parser.add_argument('--version', 
-                    default=False, 
-                    dest='version_flag', 
-                    action='store_true', 
+parser.add_argument('--version',
+                    default=False,
+                    dest='version_flag',
+                    action='store_true',
                     help='print version and exit')
-parser.add_argument('--download', '-d', 
-                    dest='download_dir', 
-                    metavar='<directory>', 
+parser.add_argument('--download', '-d',
+                    dest='download_dir',
+                    metavar='<directory>',
                     help='copy the source file')
-parser.add_argument('--unpack', '-u', 
-                    dest='unpack_dir', 
-                    metavar='<directory>', 
+parser.add_argument('--unpack', '-u',
+                    dest='unpack_dir',
+                    metavar='<directory>',
                     help='unpack the source file')
 parser.add_argument('--header', '-H')
-parser.add_argument('--volume', '-v', 
-                    metavar='<output volume>', 
+parser.add_argument('--volume', '-v',
+                    metavar='<output volume>',
                     action='append')
 parser.add_argument('--thumbnail', '-t')
 parser.add_argument('--image03', '-i')
-parser.add_argument('--format', '-f', 
-                    default='text', 
-                    help='image03 output format', 
+parser.add_argument('--format', '-f',
+                    default='text',
+                    help='image03 output format',
                     choices=('text', 'json'))
 parser.add_argument('--contents', '-c')
-parser.add_argument('--aws-access-key-id', 
+parser.add_argument('--aws-access-key-id',
                     default=os.environ.get('AWS_ACCESS_KEY_ID'))
-parser.add_argument('--aws-secret-access-key', 
+parser.add_argument('--aws-secret-access-key',
                     default=os.environ.get('AWS_SECRET_ACCESS_KEY'))
-parser.add_argument('--debug', '-D', 
-                    default=False, 
-                    dest='debug_flag', 
-                    action='store_true', 
+parser.add_argument('--aws-session-token',
+                    default=os.environ.get('AWS_SESSION_TOKEN'))
+parser.add_argument('--debug', '-D',
+                    default=False,
+                    dest='debug_flag',
+                    action='store_true',
                     help='debug flag; overrides -q')
-parser.add_argument('--dont-clean', 
-                    default=True, 
-                    dest='clean_flag', 
-                    action='store_false', 
+parser.add_argument('--dont-clean',
+                    default=True,
+                    dest='clean_flag',
+                    action='store_false',
                     help='don\'t remove the temporary directory on exit')
-parser.add_argument('--quiet', '-q', 
-                    default=0, 
-                    action='count', 
+parser.add_argument('--quiet', '-q',
+                    default=0,
+                    action='count',
                     help='quiet flag; set twice for no output')
-parser.add_argument('input', 
-                    nargs='?', 
+parser.add_argument('input',
+                    nargs='?',
                     help='the input file or S3 URL')
 
 args = parser.parse_args()
@@ -756,17 +776,18 @@ elif args.quiet:
         output_level = SILENT
 
 if args.version_flag:
-    print version
+    print
+    version
     sys.exit(0)
 
 if args.self_check_flag:
     dev_null = open('/dev/null', 'w')
     ev = 0
     # (program name, ndar_unpack functionality)
-    programs = (('mri_convert', 'most functions'), 
-                ('fslreorient2std', 'thumbnail generation'), 
-                ('slicer', 'thumbnail generation'), 
-                ('nifti_tool', 'NIfTI header dumping'), 
+    programs = (('mri_convert', 'most functions'),
+                ('fslreorient2std', 'thumbnail generation'),
+                ('slicer', 'thumbnail generation'),
+                ('nifti_tool', 'NIfTI header dumping'),
                 ('mincheader', 'MINC header dumping'))
     for (pn, fct) in programs:
         try:
@@ -788,8 +809,8 @@ if args.self_check_flag:
         message(NOTICE, 'SimpleITK okay')
     sys.exit(ev)
 
-# we allow --self-check and --version to override the need for a positional 
-# argument; since we can't have argparse require the argument, we have to 
+# we allow --self-check and --version to override the need for a positional
+# argument; since we can't have argparse require the argument, we have to
 # check for that explicitly here
 if args.input is None:
     parser.print_usage(sys.stderr)
@@ -824,6 +845,10 @@ if args.input.startswith('s3://'):
         errors.append('input is from S3 but no AWS access key ID given')
     if not args.aws_secret_access_key:
         errors.append('input is from S3 but no AWS secret access key given')
+    if not args.aws_session_token:
+        errors.append('input is from S3 but no AWS session token given')
+        
+        
 
 if args.download_dir and not os.path.isdir(args.download_dir):
     errors.append('%s: not a directory' % args.download_dir)
@@ -841,7 +866,6 @@ if errors:
 #
 
 try:
-
     tempdir = tempfile.mkdtemp()
     source_dir = os.path.join(tempdir, 'source')
     unpacked_dir = os.path.join(tempdir, 'unpacked')
@@ -860,26 +884,22 @@ try:
             # s3://bucket or s3://bucket/
             if len(parts) == 1 or not parts[1]:
                 raise GeneralError('incomplete S3 URL')
-            (bucket, path) = parts
-            cf = boto.s3.connection.OrdinaryCallingFormat()
-            conn = boto.connect_s3(args.aws_access_key_id, 
-                                   args.aws_secret_access_key, 
-                                   calling_format=cf)
-            message(DEBUG, 'getting S3 bucket %s' % bucket)
-            b = conn.get_bucket(bucket)
-            message(DEBUG, 'looking for S3 object %s' % path)
-            k = b.get_key(path)
-            if not k:
-                raise GeneralError('%s not found' % args.input)
-            message(DEBUG, 'downloading S3 object to %s' % temp_source)
-            k.get_contents_to_filename(temp_source)
-            k.close()
-            conn.close()
-        except boto.exception.S3ResponseError, exc:
-            raise GeneralError('S3 error: %s' % exc.message)
-    else:
-        message(DEBUG, 'linking source to %s' % temp_source)
-        os.symlink(os.path.abspath(args.input), temp_source)
+            (bucket, key) = parts
+            s3 = boto3.session.Session(aws_access_key_id=args.aws_access_key_id, aws_secret_access_key=args.aws_secret_access_key,
+                                       aws_session_token=args.session_token)
+            s3_client = s3.client('s3')
+            s3transfer = S3Transfer(s3_client)
+            try:
+                print('downloading S3 file %s' % args.input)
+                s3transfer.download_file(bucket, key, temp_source)
+            except botocore.exceptions.ClientError, exc:
+                print('S3 error: %s' % exc.message)
+
+        except Exception, exc:
+            raise GeneralError('Error: %s' % exc.message)
+        else:
+            message(DEBUG, 'linking source to %s' % temp_source)
+            os.symlink(os.path.abspath(args.input), temp_source)
 
     if args.input.endswith('.zip'):
         message(NOTICE, 'unpacking ZIP file...')
@@ -891,11 +911,12 @@ try:
             raise DataError('error in zip file')
     elif 'tar' in args.input:
         import tarfile
+
         message(NOTICE, 'unpacking tar file...')
         try:
-            tf = tarfile.open(temp_source,'r')
+            tf = tarfile.open(temp_source, 'r')
             for item in tf:
-                tf.extract(item,unpacked_dir)
+                tf.extract(item, unpacked_dir)
         except:
             raise DataError('error in tar file')
     else:
@@ -918,9 +939,9 @@ try:
             fo = open(args.contents, 'w')
         try:
             # traverse the directory tree under the unpacked directory
-            # relpath is the path relative to this directory (so relative 
+            # relpath is the path relative to this directory (so relative
             # to the root of the zip file)
-            # normpath will remove the leading './' that will appear in 
+            # normpath will remove the leading './' that will appear in
             # top-level entries
             for (dirpath, dirnames, filenames) in os.walk(unpacked_dir):
                 relpath = os.path.relpath(unpacked_dir, dirpath)
@@ -976,7 +997,7 @@ try:
             fo = open(args.image03, 'w')
         try:
             if args.format == 'text':
-                max_width = max([ len(f) for f in image03_fields ])
+                max_width = max([len(f) for f in image03_fields])
                 for field in image03_fields:
                     val = data.image03[field]
                     if val is None:
@@ -993,12 +1014,12 @@ try:
 
     # print a message if no other actions were taken
     if not args.volume \
-       and not args.thumbnail \
-       and not args.image03 \
-       and not args.header \
-       and not args.download_dir \
-       and not args.unpack_dir \
-       and not args.contents:
+            and not args.thumbnail \
+            and not args.image03 \
+            and not args.header \
+            and not args.download_dir \
+            and not args.unpack_dir \
+            and not args.contents:
         if not data:
             data = find_data_handler(tempdir)
         message(NOTICE, 'data okay')
